@@ -479,13 +479,11 @@ async def execute_trade(direction: str, entry_price: float, crash_from: float, d
         except Exception as allowance_err:
             log(f"[TRADE] Allowance warning: {allowance_err}")
 
-        from core.orders import OrderType as _OT
-        result = ORDER_MGR.place_order(
+        result = await ORDER_MGR.buy(
             token_id=token_id,
-            side=Side.BUY,
-            price=entry_price,
             size=shares,
-            order_type=_OT.GTC,
+            max_price=entry_price,
+            order_type="GTC",
         )
     except Exception as e:
         log(f"[TRADE] Exception: {type(e).__name__}: {e!r}")
@@ -554,13 +552,11 @@ async def execute_stop_loss(reason: str, current_bid: float, dry_run: bool = Fal
         return
 
     try:
-        from core.orders import OrderType as _OT
-        result = ORDER_MGR.place_order(
+        result = await ORDER_MGR.sell(
             token_id=token_id,
-            side=Side.SELL,
-            price=max(0.01, current_bid - 0.03),
             size=shares,
-            order_type=_OT.IOC,
+            min_price=max(0.01, current_bid - 0.03),
+            order_type="IOC",
         )
     except Exception as e:
         log(f"[STOP] Sell exception: {type(e).__name__}: {e!r}")

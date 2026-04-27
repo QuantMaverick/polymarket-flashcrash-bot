@@ -52,44 +52,46 @@ class PolymarketBook:
     """Order book state for a token."""
     token_id: str
     market: str = ""
-    bids: List[Dict] = field(default_factory=list)  # [{price, size}, ...]
-    asks: List[Dict] = field(default_factory=list)
+    # Internal dict storage (price -> size). O(1) updates, replaces O(N) list rebuild
+    # that was burning 90%+ of one CPU core during book sweeps.
+    bids_dict: Dict[float, float] = field(default_factory=dict)
+    asks_dict: Dict[float, float] = field(default_factory=dict)
     last_update: float = 0
     last_trade_price: Optional[float] = None
-    
+
+    @property
+    def bids(self) -> List[Dict]:
+        # Backward-compat: list of {"price": str, "size": str} sorted by price desc.
+        return [{"price": str(p), "size": str(s)} for p, s in sorted(self.bids_dict.items(), reverse=True)]
+
+    @property
+    def asks(self) -> List[Dict]:
+        # Backward-compat: list of {"price": str, "size": str} sorted by price asc.
+        return [{"price": str(p), "size": str(s)} for p, s in sorted(self.asks_dict.items())]
+
     @property
     def best_bid(self) -> float:
-        if not self.bids:
-            return 0
-        return max(float(b['price']) for b in self.bids)
-    
+        return max(self.bids_dict) if self.bids_dict else 0
+
     @property
     def best_ask(self) -> float:
-        if not self.asks:
-            return 1
-        return min(float(a['price']) for a in self.asks)
-    
+        return min(self.asks_dict) if self.asks_dict else 1
+
     @property
     def mid_price(self) -> float:
         return (self.best_bid + self.best_ask) / 2
-    
+
     @property
     def spread(self) -> float:
         return self.best_ask - self.best_bid
-    
+
     @property
     def best_bid_size(self) -> float:
-        if not self.bids:
-            return 0
-        best = self.best_bid
-        return sum(float(b['size']) for b in self.bids if abs(float(b['price']) - best) < 0.001)
-    
+        return self.bids_dict.get(max(self.bids_dict), 0) if self.bids_dict else 0
+
     @property
     def best_ask_size(self) -> float:
-        if not self.asks:
-            return 0
-        best = self.best_ask
-        return sum(float(a['size']) for a in self.asks if abs(float(a['price']) - best) < 0.001)
+        return self.asks_dict.get(min(self.asks_dict), 0) if self.asks_dict else 0
 
 
 class PolymarketFeed:
@@ -190,7 +192,12 @@ class PolymarketFeed:
         self._running = True
         self._thread = threading.Thread(target=self._run_ws, daemon=True)
         self._thread.start()
-        print(f"[PolymarketFeed] Started (proxy={self.use_proxy})")
+        # Application-level heartbeat + watchdog (Polymarket CLOB uses text PING/PONG, not WS control frames)
+        self._hb_thread = threading.Thread(target=self._heartbeat, daemon=True)
+        self._hb_thread.start()
+        self._wd_thread = threading.Thread(target=self._watchdog, daemon=True)
+        self._wd_thread.start()
+        print(f"[PolymarketFeed] Started (proxy={self.use_proxy}, app-level heartbeat ON)")
     
     def stop(self):
         """Stop WebSocket connection."""
@@ -316,12 +323,45 @@ class PolymarketFeed:
                 print(f"[PolymarketFeed] Reconnecting in {RECONNECT_INTERVAL_MS}ms (attempt #{self._reconnect_count})")
                 time.sleep(RECONNECT_INTERVAL_MS / 1000)
     
+    def _heartbeat(self):
+        """Send application-level PING text every 25s. Polymarket CLOB replies with PONG text."""
+        while self._running:
+            time.sleep(25)
+            if not self._running:
+                break
+            if self._connected and self._ws:
+                try:
+                    self._ws.send("PING")
+                except Exception as e:
+                    print(f"[PolymarketFeed] Heartbeat send failed: {e}")
+
+    def _watchdog(self):
+        """Force-reconnect if no message received for 45s (stale connection detection)."""
+        STALE_THRESHOLD = 45.0
+        CHECK_INTERVAL = 10.0
+        while self._running:
+            time.sleep(CHECK_INTERVAL)
+            if not self._running:
+                break
+            if not self._connected:
+                continue
+            # Only check if we've received at least one message (avoid killing fresh connections)
+            if self.last_message_time == 0:
+                continue
+            age = time.time() - self.last_message_time
+            if age > STALE_THRESHOLD:
+                print(f"[PolymarketFeed] Watchdog: no message in {age:.1f}s — forcing reconnect")
+                try:
+                    if self._ws:
+                        self._ws.close()
+                except Exception:
+                    pass
+
     def _clear_books(self):
-        """Clear all book data on disconnect to prevent stale reads."""
+        """Mark books stale on disconnect — preserve last prices to avoid 0/1 during reconnect window.
+        The next 'book' snapshot after reconnect will fully replace all levels anyway."""
         for token_id, book in self.books.items():
-            book.bids = []
-            book.asks = []
-            book.last_update = 0
+            book.last_update = 0  # mark stale — do NOT zero bids/asks (causes 0.00/1.00 reads)
     
     def _move_to_pending(self):
         """Move subscribed tokens back to pending on disconnect."""
@@ -383,61 +423,58 @@ class PolymarketFeed:
         
         book = self.books[token_id]
         book.market = event.get("market", "")
-        book.bids = event.get("bids", [])
-        book.asks = event.get("asks", [])
+        book.bids_dict = {round(float(b['price']), 4): float(b['size']) for b in event.get("bids", [])}
+        book.asks_dict = {round(float(a['price']), 4): float(a['size']) for a in event.get("asks", [])}
         book.last_update = time.time()
-        
+
         self.book_updates += 1
-        
+
         if self.on_book:
             self.on_book(book)
         if self.on_update:
             self.on_update("book", book)
-    
+
     def _process_price_change(self, event: Dict):
         """Process order book level update."""
         changes = event.get("price_changes", [])
         timestamp = event.get("timestamp", "")
-        
+
         for change in changes:
             token_id = change.get("asset_id")
             if not token_id or token_id not in self.books:
                 continue
-            
+
             book = self.books[token_id]
             price = change.get("price")
             size = change.get("size")
             side = change.get("side")
-            
+
             if price is None or size is None or side is None:
                 continue
-            
-            price = float(price)
-            size = float(size)
-            
-            # Update the appropriate side
+
+            key = round(float(price), 4)
+            size_f = float(size)
+
+            # O(1) dict update — replaces the O(N) list rebuild that pegged CPU.
             if side == "BUY":
-                self._update_level(book.bids, price, size)
+                if size_f > 0:
+                    book.bids_dict[key] = size_f
+                else:
+                    book.bids_dict.pop(key, None)
             elif side == "SELL":
-                self._update_level(book.asks, price, size)
-            
+                if size_f > 0:
+                    book.asks_dict[key] = size_f
+                else:
+                    book.asks_dict.pop(key, None)
+
             book.last_update = time.time()
-        
+
         self.price_changes += 1
-        
+
         if self.on_price_change:
             self.on_price_change(event)
         if self.on_update:
             self.on_update("price_change", event)
-    
-    def _update_level(self, levels: List[Dict], price: float, size: float):
-        """Update a single price level in the order book."""
-        # Remove existing entry at this price
-        levels[:] = [l for l in levels if abs(float(l.get('price', 0)) - price) > 0.0001]
-        
-        # Add new entry if size > 0
-        if size > 0:
-            levels.append({"price": str(price), "size": str(size)})
     
     def _process_trade(self, event: Dict):
         """Process trade event."""
